@@ -30,10 +30,13 @@
         },
     });
     const setVisible = (page, isIntersecting) => {
+        let notified = false;
         for (const { element, callback, observer } of observed) {
             if (!page.contains(element)) continue;
             callback([{ target: element, isIntersecting }], observer);
+            notified = true;
         }
+        return notified;
     };
 
     const captured = new Set();
@@ -43,13 +46,17 @@
         if (data.count) {
             count = data.count;
             bridge.postMessage("count:" + count);
+            updateVisiblePages(false);
             return;
         }
         if (captured.has(data.index)) return;
         captured.add(data.index);
         localStorage.removeItem("rdr_diag_ovr");
         const reader = new FileReader();
-        reader.onload = () => bridge.postMessage("page:" + data.index + "," + reader.result);
+        reader.onload = () => {
+            bridge.postMessage("page:" + data.index + "," + reader.result);
+            updateVisiblePages(false);
+        };
         reader.readAsDataURL(data.image);
     };
 
@@ -57,7 +64,7 @@
     const visible = new Map();
     let first = -1;
     let since = 0;
-    setInterval(() => {
+    const updateVisiblePages = (checkProgress) => {
         if (!count) return;
         const pages = document.querySelectorAll("[data-reader-page]");
         const wanted = [];
@@ -67,7 +74,7 @@
         if (wanted.length === 0) return;
         for (const i of [...visible.keys()]) {
             if (!wanted.includes(i)) {
-                setVisible(pages[i], false);
+                if (pages[i]) setVisible(pages[i], false);
                 visible.delete(i);
             }
         }
@@ -75,17 +82,20 @@
         for (const i of wanted) {
             if (now - (visible.get(i) || 0) < 10000) continue;
             if (!pages[i]) {
+                if (!checkProgress) continue;
                 bridge.postMessage("error:Page " + (i + 1) + " is missing from the reader");
                 return;
             }
-            setVisible(pages[i], true);
-            visible.set(i, now);
+            if (setVisible(pages[i], true)) visible.set(i, now);
         }
+        if (!checkProgress) return;
         if (wanted[0] !== first) {
             first = wanted[0];
             since = now;
         } else if (now - since > 30000) {
             bridge.postMessage("error:Page " + (first + 1) + " did not load");
         }
-    }, 250);
+    };
+    // The timer covers reader initialization and retries when no page is delivered.
+    setInterval(() => updateVisiblePages(true), 250);
 }
