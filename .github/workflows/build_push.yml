@@ -1,236 +1,339 @@
-name: CI
+
+name: Kairead Modern Build
+
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - '**'
-      - '!**.md'
-      - '!.github/**'
-      - '.github/scripts/**'
-      - '!.github/scripts/audit-packages.py'
-      - '!.github/scripts/cleanup-releases.py'
-      - '.github/workflows/build_push.yml'
   workflow_dispatch:
     inputs:
-      full_rebuild:
-        description: Rebuild and republish every extension instead of only what changed since the last successful run
-        type: boolean
+      extension:
+        description: 'Extension registrada o all'
+        required: true
+        default: 'es/aedex'
+        type: string
+      publish:
+        description: 'Publicar APK después de compilar'
+        required: true
         default: false
+        type: boolean
+        
 
-permissions: {}
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: true
-
-env:
-  CI_CHUNK_SIZE: 80
-  IS_PR_CHECK: false
+  group: kairead-modern-build
+  cancel-in-progress: false
 
 jobs:
-  prepare:
-    name: Prepare job
+  preparar:
+    name: Leer lista de extensiones
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      actions: read
+    timeout-minutes: 5
     outputs:
-      matrix: ${{ steps.generate-matrices.outputs.matrix }}
-      delete: ${{ steps.generate-matrices.outputs.delete }}
-      full_rebuild: ${{ steps.base.outputs.full_rebuild || steps.generate-matrices.outputs.full_rebuild }}
+      extensions: ${{ steps.lista.outputs.extensions }}
+
     steps:
-      - name: Checkout main branch
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - id: base
-        name: Get last successful CI commit
-        env:
-          GH_TOKEN: ${{ github.token }}
-          FULL_REBUILD: ${{ inputs.full_rebuild }}
-        run: |
-          # Empty tree: every module is diffed as new, so everything gets rebuilt
-          empty_tree=$(git hash-object -t tree /dev/null)
-          if [ "$FULL_REBUILD" = "true" ]; then
-            sha=$empty_tree
-          else
-            sha=$(python ./.github/scripts/find-base-sha.py build_push.yml)
-          fi
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          if [ "$sha" = "$empty_tree" ]; then
-            echo "full_rebuild=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - id: generate-matrices
-        name: Create output matrices
-        env:
-          BASE_SHA: ${{ steps.base.outputs.sha }}
-        run: |
-          python ./.github/scripts/generate-build-matrices.py "$BASE_SHA"
-
-  build:
-    name: Populate Gradle cache
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout main branch
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Descargar codigo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
-      - name: Set up Java
-        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
-        with:
-          java-version: 25
-          distribution: temurin
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
-        with:
-          cache-read-only: false
-
-      - name: Build and lint shared modules
+      - name: Preparar lista
+        id: lista
+        env:
+          SELECTED_EXTENSION: ${{ inputs.extension }}
+          PUBLISH: ${{ inputs.publish }}
         run: |
-          MODULES=(":core")
-          for dir in lib lib-multisrc; do
-            for build_file in "$dir"/*/build.gradle.kts; do
-              MODULES+=(":${dir}:$(basename "$(dirname "$build_file")")")
-            done
-          done
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
 
-          # One extension, so that what only extension builds need is cached too
-          extension=$(find src -mindepth 2 -maxdepth 2 -type d | sort | head -n 1)
-          MODULES+=(":${extension//\//:}")
+          config = json.loads(
+              Path("kairead-extensions.json").read_text(encoding="utf-8")
+          )
+          extensiones = config["extensions"]
 
-          TASKS=()
-          for module in "${MODULES[@]}"; do
-            TASKS+=("${module}:assembleRelease" "${module}:lintRelease")
-          done
-          ./gradlew "${TASKS[@]}"
+          if not extensiones:
+              raise ValueError("No hay extensiones configuradas")
 
-  build-extensions:
-    name: Build extensions (${{ matrix.chunk.number }})
-    needs: prepare
+          if len(extensiones) != len(set(extensiones)):
+              raise ValueError("Hay extensiones duplicadas")
+
+          for extension in extensiones:
+              if not re.fullmatch(r"[a-z]{2,3}/[a-z0-9_]+", extension):
+                  raise ValueError(f"Nombre invalido: {extension}")
+
+              archivo = Path(f"src/{extension}/build.gradle.kts")
+              if not archivo.is_file():
+                  raise FileNotFoundError(archivo)
+          seleccion = os.environ.get("SELECTED_EXTENSION", "all").strip()
+
+          if seleccion != "all":
+              extensiones = [e.strip() for e in seleccion.split(",")]
+              if len(extensiones) != len(set(extensiones)) or any(e not in config["extensions"] for e in extensiones):
+                  raise ValueError("Extension no registrada o duplicada")
+          if os.environ.get("PUBLISH") == "true" and os.environ["GITHUB_REF"] != "refs/heads/main":
+              raise ValueError("Solo main puede publicar")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as salida:
+              salida.write(
+                  "extensions=" + json.dumps(extensiones) + "\n"
+              )
+
+          print("Extensiones preparadas:", extensiones)
+          PY
+
+  compilar:
+    name: Compilar ${{ matrix.extension }}
+    needs: preparar
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    if: ${{ toJson(fromJson(needs.prepare.outputs.matrix).chunk) != '[]' }}
+    timeout-minutes: 35
+    
     strategy:
-      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        extension: ${{ fromJSON(needs.preparar.outputs.extensions) }}
+
     steps:
-      - name: Checkout main branch
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Descargar codigo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
-      - name: Set up Java
-        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+      - name: Configurar Java
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880
         with:
-          java-version: 25
           distribution: temurin
+          java-version: '25'
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+      - name: Configurar Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c
         with:
           cache-read-only: true
-
-      - name: Prepare signing key
-        run: |
-          echo ${{ secrets.SIGNING_KEY }} | base64 -d > signingkey.jks
-
-      - name: Build extensions (${{ matrix.chunk.number }})
+        
+      - name: Preparar firma digital Kairead
         env:
-          MODULES: ${{ join(matrix.chunk.modules, ' ') }}
-          ALIAS: ${{ secrets.ALIAS }}
+          SIGNING_KEY_BASE64: ${{ secrets.SIGNING_KEY_BASE64 }}
+        run: |
+          if [ -z "$SIGNING_KEY_BASE64" ]; then
+            echo "ERROR: Falta la clave de firma"
+            exit 1
+          fi
+
+          umask 077
+          printf '%s' "$SIGNING_KEY_BASE64" | base64 --decode > signingkey.jks
+          chmod 600 signingkey.jks
+          test -s signingkey.jks
+          echo "Clave de firma preparada correctamente"
+      
+      - name: Compilar extension
+        env:
+          EXTENSION: ${{ matrix.extension }}
           KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          ALIAS: ${{ secrets.ALIAS }}
         run: |
-          TASKS=()
-          for module in $MODULES; do
-            TASKS+=("${module}:assembleRelease")
-          done
-          ./gradlew "${TASKS[@]}"
+          chmod +x ./gradlew
 
-      - name: Upload APKs (${{ matrix.chunk.number }})
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: "github.repository == 'keiyoushi/extensions-source'"
-        with:
-          name: "individual-apks-${{ matrix.chunk.number }}"
-          path: |
-            **/build/outputs/apk/release/*.apk
-            **/build/outputs/jar/release/*.jar
-            **/build/keiyoushi-source-info.json
-          retention-days: 1
+          TAREA=":src:${EXTENSION//\//:}"
 
-      - name: Clean up CI files
-        if: always()
-        run: rm signingkey.jks
-
-  mirror:
-    name: Mirror Sync
-    needs: build-extensions
-    if: ${{ !cancelled() }}
-    uses: $/.github/workflows/codeberg_mirror.yml
-    secrets:
-      CODEBERG_SSH: ${{ secrets.CODEBERG_SSH }}
-
-  publish:
-    name: Publish extension repo
-    needs: [prepare, build-extensions]
-    # Run whenever there's anything to publish, new/changed builds OR only deletions
-    if: >-
-      always() &&
-      github.repository == 'keiyoushi/extensions-source' &&
-      needs.prepare.result == 'success' &&
-      needs.build-extensions.result != 'failure' &&
-      needs.build-extensions.result != 'cancelled' &&
-      needs.prepare.outputs.delete != '[]'
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    steps:
-      - name: Download APK artifacts
-        if: needs.build-extensions.result == 'success'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          path: ~/apk-artifacts
-
-      - name: Checkout main branch
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: main
-          path: main
-          persist-credentials: false
-
-      - name: Checkout repo branch
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: keiyoushi/extensions
-          token: ${{ secrets.BOT_PAT }}
-          ref: repo
-          path: repo
-          persist-credentials: true
-
-      - name: Publish and deploy repo
+          ./gradlew "${TAREA}:spotlessCheck"
+          ./gradlew "${TAREA}:assembleRelease" "${TAREA}:lintRelease"
+          
+      - name: Verificar firma digital Kairead
         env:
-          DELETE: ${{ needs.prepare.outputs.delete }}
-          FULL_REBUILD: ${{ needs.prepare.outputs.full_rebuild }}
-          GH_TOKEN: ${{ secrets.BOT_PAT }}
+          EXTENSION: ${{ matrix.extension }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          ALIAS: ${{ secrets.ALIAS }}
         run: |
-          cd repo
-          python -m pip install --user --upgrade protobuf
-          python -u ../main/.github/scripts/publish-repo.py "$DELETE" "$GITHUB_SHA" "$FULL_REBUILD"
-          git config --global user.email "156378334+keiyoushi-bot@users.noreply.github.com"
-          git config --global user.name "keiyoushi-bot"
-          git status
-          if [ -n "$(git status --porcelain)" ]; then
-            git add .
-            git commit -m "Update extensions repo"
-            git push
-            curl https://purge.jsdelivr.net/gh/keiyoushi/extensions@repo/index.json
-            curl https://purge.jsdelivr.net/gh/keiyoushi/extensions@repo/index.pb
-          else
-            echo "No changes to commit"
+          set -euo pipefail
+
+          APK="$(find "src/$EXTENSION/build/outputs" -type f -name '*.apk' -print -quit)"
+          test -n "$APK"
+
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -type f -name apksigner | sort -V | tail -n 1)"
+          test -n "$APKSIGNER"
+
+          EXPECTED="$(keytool -exportcert -alias "$ALIAS" -keystore signingkey.jks -storepass "$KEY_STORE_PASSWORD" | sha256sum | cut -d' ' -f1)"
+          echo "=== Certificados detectados en la APK ==="
+          "$APKSIGNER" verify --print-certs "$APK"
+          ACTUAL="$("$APKSIGNER" verify --print-certs "$APK" | sed -n 's/.*certificate SHA-256 digest: //p' | head -n 1)"
+          echo "APK examinada: $(basename "$APK")"
+          echo "Huella esperada: $EXPECTED"
+          echo "Huella encontrada: ${ACTUAL:-NO DETECTADA}"
+          if [ -z "$ACTUAL" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "ERROR: La APK no tiene la firma esperada"
+            exit 1
           fi
+
+          echo "Firma digital Kairead verificada correctamente"
+          
+      - name: Verificar identidad y preparar nombre de APK
+        env:
+          EXTENSION: ${{ matrix.extension }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          ext = os.environ["EXTENSION"]
+          root = Path("src") / ext / "build"
+          meta = json.loads((root / "keiyoushi-source-info.json").read_text())
+          if ext == "es/aedex":
+              assert meta["packageName"] == "eu.kanade.tachiyomi.extension.es.templescanesp"
+              assert meta["sources"][0]["id"] == 3451196845457607826
+              assert int(meta["versionCode"]) > 106071
+          apk, = (root / "outputs/apk/release").glob("*.apk")
+          pkg = meta["packageName"].removeprefix("eu.kanade.tachiyomi.extension.")
+          apk.rename(apk.with_name(f"kairead-{pkg}-v{meta['versionName']}.apk"))
+          PY
+
+      - name: Guardar APK individual
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: Kairead-${{ strategy.job-index }}
+          path: src/${{ matrix.extension }}/build/outputs/**/*.apk
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Publicar APK individual
+        if: ${{ inputs.publish == true && github.ref == 'refs/heads/main' }}
+        env:
+          GH_TOKEN: ${{ secrets.KAYHELTH_REPO_TOKEN }}
+          EXTENSION: ${{ matrix.extension }}
+        run: |
+          python3 - <<'PY'
+          import glob
+          import os
+          import shutil
+          import subprocess
+          import tempfile
+          import time
+          from pathlib import Path
+
+          extension = os.environ["EXTENSION"]
+          archivos = glob.glob(
+              f"src/{extension}/build/outputs/**/*.apk",
+              recursive=True,
+          )
+
+          if len(archivos) != 1:
+              raise SystemExit(
+                  f"{extension}: se esperaba una APK, encontradas: {archivos}"
+              )
+
+          if not os.environ.get("GH_TOKEN"):
+              raise SystemExit("Falta KAYHELTH_REPO_TOKEN")
+
+          def git(carpeta, *argumentos):
+              subprocess.run(
+                  ["git", "-C", str(carpeta), *argumentos],
+                  check=True,
+              )
+
+          with tempfile.TemporaryDirectory() as temporal:
+              carpeta = Path(temporal) / "repo"
+
+              subprocess.run(["gh", "auth", "setup-git"], check=True)
+              subprocess.run([
+                  "git", "clone",
+                  "https://github.com/helthstin/KayHelthRepo.git",
+                  str(carpeta),
+              ], check=True)
+
+              import json
+
+              catalogo = json.loads(
+                  (carpeta / "index.json").read_text(encoding="utf-8")
+              )
+              metadata_path = (
+                  Path("src") / extension /
+                  "build/keiyoushi-source-info.json"
+              )
+              metadata = json.loads(
+                  metadata_path.read_text(encoding="utf-8")
+              )
+              paquete = metadata["packageName"]
+
+              actual = next(
+                  (
+                      item
+                      for item in catalogo["extensionList"]["extensions"]
+                      if item["packageName"] == paquete
+                  ),
+                  None,
+              )
+
+              if actual and int(actual["versionCode"]) >= int(metadata["versionCode"]):
+                  print(
+                      f"{extension}: versión ya publicada "
+                      "o más reciente. Se omite."
+                  )
+                  raise SystemExit(0)
+                  
+              destino = carpeta / "apk" / Path(archivos[0]).name
+              destino.parent.mkdir(parents=True, exist_ok=True)
+
+              if destino.exists():
+                  if destino.read_bytes() != Path(archivos[0]).read_bytes():
+                      raise SystemExit("APK existente con contenido distinto")
+                  print(
+                      f"{extension}: APK existente. "
+                      "Se conserva y se revisan sus metadatos."
+                  )
+              else:
+                  shutil.copy2(archivos[0], destino)
+                  print(f"{extension}: nueva APK preparada")
+              
+              subprocess.run([
+                  "python3",
+                  "scripts/update_extension_index.py",
+                  str(carpeta),
+                  extension,
+                  archivos[0],
+              ], check=True)
+
+              git(carpeta, "config", "user.name", "github-actions[bot]")
+              git(
+                  carpeta, "config", "user.email",
+                  "41898282+github-actions[bot]@users.noreply.github.com",
+              )
+
+              git( carpeta,
+                  "add",
+                  str(destino.relative_to(carpeta)),
+                  "index.json",
+              )
+
+              cambios = subprocess.run([
+                  "git", "-C", str(carpeta),
+                  "diff", "--cached", "--quiet",
+              ]).returncode
+
+              if cambios == 0:
+                  print(f"{extension}: APK sin cambios")
+              else:
+                  git(
+                      carpeta, "commit",
+                      "-m", f"Publicar APK de {extension}",
+                  )
+
+                  for intento in range(1, 9):
+                      try:
+                          git(carpeta, "pull", "--rebase", "origin", "main")
+                          git(carpeta, "push", "origin", "main")
+                          print(f"{extension}: APK publicada")
+                          break
+                      except subprocess.CalledProcessError:
+                          if intento == 8:
+                              raise
+                          print("Reintentando publicacion...", intento)
+                          time.sleep(3)
+          PY
+          
+
+      - name: Retirar clave temporal
+        if: always()
+        run: rm -f signingkey.jks
