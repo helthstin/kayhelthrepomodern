@@ -5,7 +5,7 @@ plugins {
 }
 
 keiyoushi {
-    name = "Mangas.in"
+    name = "M440"
     versionCode = 3
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
@@ -13,6 +13,7 @@ keiyoushi {
 
     source {
         lang = "es"
+        id = 1954354064815247113L
         baseUrl = "https://m440.in"
     }
 }
